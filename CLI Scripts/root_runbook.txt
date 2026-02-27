@@ -1,0 +1,219 @@
+###############################################
+ROOT RUNBOOK — SECURE S3 (SSE-KMS + VERSIONING)
+###############################################
+
+# PURPOSE
+# Root-only bootstrap + recovery + cleanup for a secure, versioned, KMS-encrypted S3 bucket.
+# This runbook assumes:
+# - Bucket has default encryption SSE-KMS
+# - Bucket policy denies non-SSE-KMS PutObject
+# - Versioning is Enabled (so deletes create delete markers)
+#
+# Use root ONLY for:
+# - stack bootstrap / repair
+# - emergency recovery
+# - full bucket wipe (all versions + delete markers)
+# - deleting IAM login profiles that block stack deletion
+
+###############################################
+SET THESE VARIABLES FIRST
+###############################################
+
+STACK="Secure-S3"
+REGION="us-west-2"                 # CHANGE IF NEEDED
+BUCKET="jon-secure-bucket-aws"     # CHANGE IF NEEDED
+KMS_ALIAS="alias/secure-data-bucket-key"  # CHANGE IF NEEDED
+TEMPLATE_PATH="secure_s3.yaml"     # PATH TO YOUR CFN TEMPLATE
+
+###############################################
+VERIFY ROOT IDENTITY
+###############################################
+
+aws sts get-caller-identity
+# EXPECT: arn:aws:iam::<ACCOUNT_ID>:root
+
+###############################################
+STACK CREATE / UPDATE
+###############################################
+
+# Create stack (first time)
+aws cloudformation create-stack \
+  --region "$REGION" \
+  --stack-name "$STACK" \
+  --template-body "file://${TEMPLATE_PATH}" \
+  --parameters \
+    ParameterKey=BucketName,ParameterValue="$BUCKET" \
+    ParameterKey=KmsAliasName,ParameterValue="$KMS_ALIAS" \
+  --capabilities CAPABILITY_NAMED_IAM
+
+# Wait for create to finish (optional)
+aws cloudformation wait stack-create-complete \
+  --region "$REGION" \
+  --stack-name "$STACK"
+
+# If updating later:
+# aws cloudformation update-stack \
+#   --region "$REGION" \
+#   --stack-name "$STACK" \
+#   --template-body "file://${TEMPLATE_PATH}" \
+#   --parameters \
+#     ParameterKey=BucketName,ParameterValue="$BUCKET" \
+#     ParameterKey=KmsAliasName,ParameterValue="$KMS_ALIAS" \
+#   --capabilities CAPABILITY_NAMED_IAM
+
+###############################################
+STACK OUTPUTS
+###############################################
+
+aws cloudformation describe-stacks \
+  --region "$REGION" \
+  --stack-name "$STACK" \
+  --query "Stacks[0].Outputs" \
+  --output table
+
+###############################################
+SECURE BUCKET SANITY CHECKS
+###############################################
+
+# Confirm bucket exists
+aws s3api head-bucket --bucket "$BUCKET"
+
+# Confirm default encryption (SSE-KMS)
+aws s3api get-bucket-encryption \
+  --bucket "$BUCKET" \
+  --output json
+
+# Confirm versioning enabled
+aws s3api get-bucket-versioning \
+  --bucket "$BUCKET" \
+  --output json
+
+# Confirm bucket policy is attached (should include Deny for non-SSE-KMS PutObject)
+aws s3api get-bucket-policy \
+  --bucket "$BUCKET" \
+  --output text
+
+###############################################
+UPLOAD / DOWNLOAD (ROOT) — SECURE PATTERN
+###############################################
+
+# Create a test file
+echo "secure test $(date -u)" > /tmp/secure_test.csv
+
+# Upload MUST include SSE-KMS header (your bucket policy denies otherwise)
+aws s3 cp /tmp/secure_test.csv "s3://${BUCKET}/secure_test.csv" \
+  --sse aws:kms
+
+# Verify encryption on the uploaded object
+aws s3api head-object \
+  --bucket "$BUCKET" \
+  --key "secure_test.csv" \
+  --query "{SSE:ServerSideEncryption,KMS:SSEKMSKeyId,Size:ContentLength,LastModified:LastModified}" \
+  --output table
+
+# Download
+aws s3 cp "s3://${BUCKET}/secure_test.csv" /tmp/secure_test_dl.csv
+cat /tmp/secure_test_dl.csv
+
+###############################################
+VERSIONING DEMO (UPLOAD NEW VERSION)
+###############################################
+
+echo "secure test v2 $(date -u)" > /tmp/secure_test.csv
+
+aws s3 cp /tmp/secure_test.csv "s3://${BUCKET}/secure_test.csv" \
+  --sse aws:kms
+
+# List versions for this key
+aws s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --prefix "secure_test.csv" \
+  --query "Versions[].{IsLatest:IsLatest,VersionId:VersionId,Size:Size,LastModified:LastModified}" \
+  --output table
+
+###############################################
+DELETE (LATEST) — CREATES DELETE MARKER
+###############################################
+
+aws s3 rm "s3://${BUCKET}/secure_test.csv"
+
+# Show versions + delete markers
+aws s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --prefix "secure_test.csv" \
+  --query "{Versions: Versions[].{IsLatest:IsLatest,VersionId:VersionId,LastModified:LastModified}, DeleteMarkers: DeleteMarkers[].{IsLatest:IsLatest,VersionId:VersionId,LastModified:LastModified}}" \
+  --output json
+
+###############################################
+RESTORE FILE (DELETE THE DELETE MARKER)
+###############################################
+
+# Find delete marker version id:
+aws s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --prefix "secure_test.csv" \
+  --query "DeleteMarkers[?IsLatest==`true`].VersionId" \
+  --output text
+
+# Then delete that delete marker:
+# aws s3api delete-object \
+#   --bucket "$BUCKET" \
+#   --key "secure_test.csv" \
+#   --version-id DELETE_MARKER_VERSION_ID
+
+###############################################
+FULL BUCKET WIPE (REQUIRED BEFORE STACK DELETE)
+###############################################
+
+# IMPORTANT: versioned buckets require deleting ALL Versions and ALL DeleteMarkers.
+# This removes everything so the bucket can be deleted by CloudFormation.
+
+aws s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+  --output json > /tmp/versions.json
+
+aws s3api delete-objects \
+  --bucket "$BUCKET" \
+  --delete file:///tmp/versions.json
+
+aws s3api list-object-versions \
+  --bucket "$BUCKET" \
+  --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+  --output json > /tmp/delete_markers.json
+
+aws s3api delete-objects \
+  --bucket "$BUCKET" \
+  --delete file:///tmp/delete_markers.json
+
+# Verify truly empty (should return empty lists)
+aws s3api list-object-versions --bucket "$BUCKET" --max-items 5
+
+###############################################
+IAM CLEANUP THAT CAN BLOCK STACK DELETE
+###############################################
+
+# If CloudFormation fails to delete AdminUser due to login profile:
+# "Cannot delete entity, must delete login profile first."
+
+# List users (find your admin user name)
+aws iam list-users --query "Users[].UserName" --output table
+
+# Delete login profile (example user name)
+# aws iam delete-login-profile --user-name test-admin
+
+###############################################
+STACK DELETE
+###############################################
+
+aws cloudformation delete-stack \
+  --region "$REGION" \
+  --stack-name "$STACK"
+
+aws cloudformation wait stack-delete-complete \
+  --region "$REGION" \
+  --stack-name "$STACK"
+
+###############################################
+END ROOT RUNBOOK
+###############################################

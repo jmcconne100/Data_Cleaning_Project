@@ -1,0 +1,108 @@
+UPLOAD FILES TO SECURE S3 BUCKET (Admin Role)
+===========================================
+
+Purpose
+- Upload two local files to a KMS-encrypted S3 bucket using the Admin role:
+  - loan_default.csv
+  - Sanity_Check_Small_Data.xlsx
+- Verify the files exist locally
+- Upload with SSE-KMS (required by bucket policy)
+- Confirm successful upload and encryption
+
+Assumptions
+- Bucket: jon-secure-bucket-aws
+- Destination: bucket root (no prefixes)
+- You are operating as AdminRole (via:
+  - exported STS credentials, OR
+  - AWS CLI profile: admin-role)
+- AWS CLI is installed and configured
+- Bucket policy may require the SSE header (`--sse aws:kms`)
+
+-----------------------------------------------------------------------
+macOS / Linux
+-----------------------------------------------------------------------
+
+# Step 1 — Verify files exist on Desktop
+ls ~/Desktop/loan_default.csv
+ls ~/Desktop/Sanity_Check_Small_Data.xlsx
+
+# Step 2 — Upload loan_default.csv
+aws s3 cp ~/Desktop/loan_default.csv \
+  s3://jon-secure-bucket-aws/loan_default.csv \
+  --sse aws:kms \
+  --profile admin-role
+
+# Step 3 — Upload Sanity_Check_Small_Data.xlsx
+aws s3 cp ~/Desktop/Sanity_Check_Small_Data.xlsx \
+  s3://jon-secure-bucket-aws/Sanity_Check_Small_Data.xlsx \
+  --sse aws:kms \
+  --profile admin-role
+
+# Step 4 — Confirm uploads
+aws s3 ls s3://jon-secure-bucket-aws/ --profile admin-role
+
+# Step 5 — Confirm encryption (optional but recommended)
+aws s3api head-object \
+  --bucket jon-secure-bucket-aws \
+  --key loan_default.csv \
+  --query "{Size:ContentLength,Encryption:ServerSideEncryption,KMS:SSEKMSKeyId}" \
+  --output table \
+  --profile admin-role
+
+aws s3api head-object \
+  --bucket jon-secure-bucket-aws \
+  --key Sanity_Check_Small_Data.xlsx \
+  --query "{Size:ContentLength,Encryption:ServerSideEncryption,KMS:SSEKMSKeyId}" \
+  --output table \
+  --profile admin-role
+
+-----------------------------------------------------------------------
+Windows (PowerShell)
+-----------------------------------------------------------------------
+
+# Step 1 — Verify files exist on Desktop
+ls $HOME\Desktop\loan_default.csv
+ls $HOME\Desktop\Sanity_Check_Small_Data.xlsx
+
+# Step 2 — Upload loan_default.csv
+aws s3 cp "$HOME\Desktop\loan_default.csv" `
+  "s3://jon-secure-bucket-aws/loan_default.csv" `
+  --sse aws:kms `
+  --profile admin-role
+
+# Step 3 — Upload Sanity_Check_Small_Data.xlsx
+aws s3 cp "$HOME\Desktop\Sanity_Check_Small_Data.xlsx" `
+  "s3://jon-secure-bucket-aws/Sanity_Check_Small_Data.xlsx" `
+  --sse aws:kms `
+  --profile admin-role
+
+# Step 4 — Confirm uploads
+aws s3 ls s3://jon-secure-bucket-aws/ --profile admin-role
+
+# Step 5 — Confirm encryption (optional but recommended)
+aws s3api head-object `
+  --bucket jon-secure-bucket-aws `
+  --key loan_default.csv `
+  --query "{Size:ContentLength,Encryption:ServerSideEncryption,KMS:SSEKMSKeyId}" `
+  --output table `
+  --profile admin-role
+
+aws s3api head-object `
+  --bucket jon-secure-bucket-aws `
+  --key Sanity_Check_Small_Data.xlsx `
+  --query "{Size:ContentLength,Encryption:ServerSideEncryption,KMS:SSEKMSKeyId}" `
+  --output table `
+  --profile admin-role
+
+-----------------------------------------------------------------------
+Notes / Common Issues
+-----------------------------------------------------------------------
+- AccessDenied on upload:
+  - Ensure you are using AdminRole (`aws sts get-caller-identity`)
+  - Ensure `--sse aws:kms` is included if bucket policy enforces it
+- 404 Not Found on head-object:
+  - The object was not uploaded or the key name is wrong
+  - Re-list bucket: aws s3 ls s3://jon-secure-bucket-aws/
+- Overwriting either file later will create a new VersionId (versioning enabled)
+
+End of runbook.

@@ -1,0 +1,115 @@
+ANALYST CLI TEST RUNBOOK (Test-Analyst → Assume AnalystRole → Read OK / Write FAIL)
+===============================================================================
+Purpose
+- Validate that a non-root identity (test-analyst) can assume the AnalystRole and:
+  - READ objects from the secure bucket (should succeed)
+  - WRITE objects to the bucket (should fail)
+
+Notes / Assumptions
+- Bucket: jon-secure-bucket-aws
+- This runbook assumes you already uploaded a known test object with AdminRole.
+  Choose ONE of these paths and use it consistently:
+  A) Bucket root key:        test.csv
+  B) Prefix key (raw/):      raw/test.csv
+- Your earlier admin test used bucket root (test.csv). Your analyst snippet uses raw/test.csv.
+  Pick one. Below I show BOTH options; comment out the one you’re not using.
+- If your bucket policy enforces SSE-KMS headers on upload, include: --sse aws:kms
+- This runbook uses STS temporary credentials via environment variables.
+
+Before you start (one-time)
+1) Ensure access keys exist for IAM user test-analyst (IAM Console → Users → test-analyst → Security credentials)
+2) Configure the CLI profile for test-analyst:
+   - aws configure --profile test-analyst
+3) Get the Analyst role ARN from CloudFormation Outputs:
+   - arn:aws:iam::286036002000:role/Secure-S3-AnalystRole   (example)
+
+---------------------------------------------------------------------------
+STEP 1 — Configure and verify the base identity (test-analyst user)
+---------------------------------------------------------------------------
+
+aws configure --profile test-analyst
+
+aws sts get-caller-identity --profile test-analyst
+# Expect Arn like: arn:aws:iam::286036002000:user/test-analyst
+
+---------------------------------------------------------------------------
+STEP 2 — Assume the AnalystRole using test-analyst
+---------------------------------------------------------------------------
+
+aws sts assume-role \
+  --profile test-analyst \
+  --role-arn arn:aws:iam::286036002000:role/Secure-S3-AnalystRole \
+  --role-session-name analyst-test
+# Copy Credentials.{AccessKeyId,SecretAccessKey,SessionToken} from the output
+
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+
+aws sts get-caller-identity
+# Expect Arn like: arn:aws:sts::286036002000:assumed-role/Secure-S3-AnalystRole/analyst-test
+
+---------------------------------------------------------------------------
+STEP 3 — READ TEST (should succeed)
+---------------------------------------------------------------------------
+
+# OPTION A (admin test in bucket root):
+aws s3 cp s3://jon-secure-bucket-aws/test.csv ./dl.csv
+
+# OPTION B (if you used raw/ prefix instead):
+# aws s3 cp s3://jon-secure-bucket-aws/raw/test.csv ./dl.csv
+
+cat ./dl.csv
+# Expect to see the contents of the test file
+
+# (Optional) Confirm encryption metadata (should still be aws:kms)
+# OPTION A:
+aws s3api head-object \
+  --bucket jon-secure-bucket-aws \
+  --key test.csv \
+  --query "{Enc:ServerSideEncryption,Kms:SSEKMSKeyId,Size:ContentLength}" \
+  --output table
+
+# OPTION B:
+# aws s3api head-object \
+#   --bucket jon-secure-bucket-aws \
+#   --key raw/test.csv \
+#   --query "{Enc:ServerSideEncryption,Kms:SSEKMSKeyId,Size:ContentLength}" \
+#   --output table
+
+---------------------------------------------------------------------------
+STEP 4 — WRITE TEST (should FAIL)
+---------------------------------------------------------------------------
+
+echo "should fail $(date -Iseconds)" > fail.csv
+
+# OPTION A (attempt write to bucket root):
+aws s3 cp fail.csv s3://jon-secure-bucket-aws/fail.csv --sse aws:kms
+
+# OPTION B (attempt write to raw/ prefix):
+# aws s3 cp fail.csv s3://jon-secure-bucket-aws/raw/fail.csv --sse aws:kms
+
+# Expected result: AccessDenied (analyst is read-only)
+
+---------------------------------------------------------------------------
+STEP 5 — Cleanup: unset temporary credentials (recommended)
+---------------------------------------------------------------------------
+
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN
+
+Troubleshooting
+- If assume-role fails with AccessDenied:
+  - Verify group membership:
+    aws iam list-groups-for-user --user-name test-analyst --profile test-analyst
+  - Verify Analyst group policy allows sts:AssumeRole to AnalystRole:
+    aws iam list-group-policies --group-name Secure-S3-AnalystGroup --profile test-analyst
+- If read fails with 404 Not Found:
+  - Wrong key path (test.csv vs raw/test.csv) OR object not uploaded
+  - List objects (as admin-role): aws s3 ls s3://jon-secure-bucket-aws/ --recursive --profile admin-role
+- If write succeeds (unexpected):
+  - Your AnalystRole has write permissions or policy scope is too broad.
+  - Review AnalystRole inline policy and bucket policy.
+
+

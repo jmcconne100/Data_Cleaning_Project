@@ -1,0 +1,224 @@
+AWS OPS RUNBOOK (Top Commands) — Secure-S3 + KMS + RBAC + Versioning
+===================================================================
+
+SUMMARY
+- This runbook helps you operate and verify your Secure-S3 stack:
+  1) Confirm identity/profile context
+  2) Inspect IAM users/groups and role assumption plumbing
+  3) Inspect CloudFormation outputs/status and drift
+  4) Operate S3 (list/upload/download/delete) under KMS encryption and versioning
+  5) Verify KMS key status and rotation
+  6) Run RBAC smoke tests (admin can write, analyst cannot)
+
+MODIFICATIONS YOU MUST MAKE (ONE-TIME)
+- Replace these placeholders everywhere they appear:
+  - STACK_NAME:      Secure-S3
+  - BUCKET_NAME:     jon-secure-bucket-aws
+  - KMS_ALIAS:       alias/secure-data-bucket-key
+  - ADMIN_GROUP:     Secure-S3-AdminGroup
+  - ADMIN_PROFILE:   admin-role
+  - ANALYST_PROFILE: analyst-role
+- For restore commands, replace:
+  - YOUR_OLD_VERSION_ID with a real VersionId from list-object-versions
+
+PREREQS BEFORE RUNNING
+1) AWS CLI installed and configured
+   - aws --version
+
+2) Region set correctly for your CLI (same as your stack region)
+   - aws configure list
+
+3) Profiles exist (role-chained recommended)
+   - aws configure list-profiles
+   - You should have at least:
+       admin-role   (assumes AdminRole)
+       analyst-role (assumes AnalystRole)
+
+4) Your bucket policy may require SSE-KMS headers on upload:
+   - If so, ALWAYS include: --sse aws:kms
+
+5) For commands without an explicit --profile:
+   - They run under your current default profile. Add --profile as needed.
+
+--------------------------------------------------------------------
+A) IDENTITY & CONTEXT (RUN THESE FIRST)
+--------------------------------------------------------------------
+
+# Who am I right now?
+aws sts get-caller-identity
+
+# Confirm CLI config / region / credential source
+aws configure list
+
+# Confirm profiles are available
+aws configure list-profiles
+
+
+--------------------------------------------------------------------
+B) IAM VISIBILITY (USERS / GROUPS / POLICIES)
+--------------------------------------------------------------------
+
+# List users (verify test-admin / test-analyst exist)
+aws iam list-users
+
+# Show group membership for lab users (confirms intended wiring)
+aws iam list-groups-for-user --user-name test-admin
+aws iam list-groups-for-user --user-name test-analyst
+
+# Inspect Admin group policies (should include sts:AssumeRole to AdminRole)
+aws iam list-attached-group-policies --group-name Secure-S3-AdminGroup
+aws iam list-group-policies --group-name Secure-S3-AdminGroup
+
+# (Optional) Inspect Analyst group policies
+# aws iam list-attached-group-policies --group-name Secure-S3-AnalystGroup
+# aws iam list-group-policies --group-name Secure-S3-AnalystGroup
+
+
+--------------------------------------------------------------------
+C) CLOUDFORMATION (OUTPUTS / STATUS / EVENTS / DRIFT)
+--------------------------------------------------------------------
+
+# Outputs (source of truth for ARNs, bucket name, key arn, role arns)
+aws cloudformation describe-stacks \
+  --stack-name "Secure-S3" \
+  --query "Stacks[0].Outputs" \
+  --output table
+
+# Stack status (quick health check)
+aws cloudformation describe-stacks \
+  --stack-name "Secure-S3" \
+  --query "Stacks[0].StackStatus" \
+  --output text
+
+# Recent events (useful for debugging failed updates)
+aws cloudformation describe-stack-events \
+  --stack-name "Secure-S3" \
+  --max-items 15 \
+  --output table
+
+# Drift detection (NOTE: this lists drifted resources if drift detection has been run)
+aws cloudformation describe-stack-resource-drifts \
+  --stack-name "Secure-S3" \
+  --query "StackResourceDrifts[?StackResourceDriftStatus!='IN_SYNC'].{LogicalId:LogicalResourceId,Status:StackResourceDriftStatus,Type:ResourceType}" \
+  --output table
+
+# (Optional) Start a drift detection run, then poll for results
+# DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "Secure-S3" --query StackDriftDetectionId --output text)
+# aws cloudformation describe-stack-drift-detection-status --stack-drift-detection-id "$DRIFT_ID" --output table
+
+
+--------------------------------------------------------------------
+D) S3 NAVIGATION (LIST “FOLDERS” AND FILES)
+--------------------------------------------------------------------
+
+# List top-level prefixes (“folders”)
+aws s3 ls s3://jon-secure-bucket-aws/ --profile admin-role
+
+# List files in a prefix (current level only)
+aws s3 ls s3://jon-secure-bucket-aws/raw/ --profile admin-role
+
+# Recursive listing (entire prefix)
+aws s3 ls s3://jon-secure-bucket-aws/raw/ --recursive --profile admin-role
+
+
+--------------------------------------------------------------------
+E) S3 OBJECT OPS (UPLOAD / DOWNLOAD / DELETE)
+--------------------------------------------------------------------
+
+# Upload (SSE-KMS header required by many strict bucket policies)
+# NOTE: Change the local filename as needed.
+aws s3 cp test.csv s3://jon-secure-bucket-aws/raw/test.csv \
+  --sse aws:kms \
+  --profile admin-role
+
+# Download
+aws s3 cp s3://jon-secure-bucket-aws/raw/test.csv ./test_download.csv \
+  --profile admin-role
+
+# Delete (with versioning enabled this creates a delete marker)
+aws s3 rm s3://jon-secure-bucket-aws/raw/test.csv \
+  --profile admin-role
+
+# Safe delete preview (always do this before recursive deletes)
+aws s3 rm s3://jon-secure-bucket-aws/raw/ --recursive --dryrun \
+  --profile admin-role
+
+
+--------------------------------------------------------------------
+F) S3 METADATA & ENCRYPTION CHECKS
+--------------------------------------------------------------------
+
+# Confirm the object exists and is encrypted with KMS
+aws s3api head-object \
+  --bucket jon-secure-bucket-aws \
+  --key raw/test.csv \
+  --query "{Size:ContentLength,Modified:LastModified,Encryption:ServerSideEncryption,KMS:SSEKMSKeyId}" \
+  --output table \
+  --profile admin-role
+
+
+--------------------------------------------------------------------
+G) VERSIONING: LIST VERSIONS + RESTORE A PRIOR VERSION
+--------------------------------------------------------------------
+
+# List all versions for a specific key
+aws s3api list-object-versions \
+  --bucket jon-secure-bucket-aws \
+  --prefix raw/test.csv \
+  --profile admin-role
+
+# Restore by copying a specific old version forward into a restore/ prefix
+# 1) Copy a VersionId from the command above
+# 2) Paste it below in place of YOUR_OLD_VERSION_ID
+aws s3api copy-object \
+  --bucket jon-secure-bucket-aws \
+  --copy-source "jon-secure-bucket-aws/raw/test.csv?versionId=YOUR_OLD_VERSION_ID" \
+  --key "restore/test_restored.csv" \
+  --server-side-encryption aws:kms \
+  --profile admin-role
+
+
+--------------------------------------------------------------------
+H) KMS STATUS (KEY HEALTH + ROTATION)
+--------------------------------------------------------------------
+
+# Describe key (alias is fine)
+aws kms describe-key \
+  --key-id alias/secure-data-bucket-key \
+  --profile admin-role
+
+# Confirm rotation enabled
+aws kms get-key-rotation-status \
+  --key-id alias/secure-data-bucket-key \
+  --profile admin-role
+
+
+--------------------------------------------------------------------
+I) RBAC SMOKE TESTS (ADMIN CAN WRITE, ANALYST CANNOT)
+--------------------------------------------------------------------
+
+# Admin upload should succeed
+aws s3 cp test.csv s3://jon-secure-bucket-aws/raw/admin_test.csv \
+  --sse aws:kms \
+  --profile admin-role
+
+# Analyst download should succeed
+aws s3 cp s3://jon-secure-bucket-aws/raw/admin_test.csv ./analyst_dl.csv \
+  --profile analyst-role
+
+# Analyst upload should FAIL (expected)
+aws s3 cp test.csv s3://jon-secure-bucket-aws/raw/analyst_should_fail.csv \
+  --sse aws:kms \
+  --profile analyst-role
+
+
+NOTES / TROUBLESHOOTING QUICK HITS
+- 404 Not Found on head-object:
+  - The key path is wrong (e.g., missing "raw/") OR the object was never uploaded.
+  - Use: aws s3 ls s3://<bucket>/raw/ --recursive
+- AccessDenied on uploads:
+  - You may be missing "--sse aws:kms" (if bucket policy enforces the header)
+  - Or you are using the wrong profile/identity (check caller-identity).
+- Drift:
+  - If resources were edited in-console, drift will show IN_SYNC != true.
+  - Prefer updating via CloudFormation rather than manual edits.

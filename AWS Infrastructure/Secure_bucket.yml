@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Secure S3 bucket with SSE-KMS, versioning, and IAM roles/users for admin/analyst access.
+  (TLS enforcement removed.)
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name
+
+  KmsAliasName:
+    Type: String
+    Default: alias/secure-data-bucket-key
+    Description: KMS alias name (must start with alias/)
+
+  AdminUserName:
+    Type: String
+    Default: test-admin
+
+  AnalystUserName:
+    Type: String
+    Default: test-analyst
+
+Resources:
+  # ----------------------------
+  # KMS Key + Alias
+  # ----------------------------
+  DataBucketKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for encrypting objects in the secure data bucket
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+          # Allow S3 (in this account/region) to use the key for SSE-KMS.
+          - Sid: AllowUseViaS3InAccount
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Sub ${AWS::AccountId}
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+
+          # Console/CLI key *visibility* for these roles without creating a CFN circular dependency.
+          # (No !GetAtt AdminRole/AnalystRole here on purpose.)
+          - Sid: AllowDescribeForNamedRoles
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:DescribeKey
+              - kms:GetKeyPolicy
+              - kms:GetKeyRotationStatus
+              - kms:ListResourceTags
+              - kms:ListGrants
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-AdminRole
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-AnalystRole
+
+  DataBucketKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref KmsAliasName
+      TargetKeyId: !Ref DataBucketKey
+
+  # ----------------------------
+  # S3 Bucket
+  # ----------------------------
+  SecureDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataBucketKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  # Deny uploads that explicitly try to use a non-KMS encryption header.
+  # (Allows requests with no header so bucket default encryption still works.)
+  SecureDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecureDataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyIncorrectEncryptionHeader
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub arn:aws:s3:::${SecureDataBucket}/*
+            Condition:
+              StringNotEqualsIfExists:
+                s3:x-amz-server-side-encryption: "aws:kms"
+
+  # ----------------------------
+  # IAM Roles
+  # ----------------------------
+  AdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-AdminRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AdminS3KmsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListAllBucketsForConsole
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                Resource: "*"
+
+              - Sid: ListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub arn:aws:s3:::${SecureDataBucket}
+
+              - Sid: ObjectRW
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub arn:aws:s3:::${SecureDataBucket}/*
+
+              - Sid: UseKmsKeyForS3Objects
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt DataBucketKey.Arn
+
+              # Helps the console "load" keys/aliases.
+              - Sid: KmsConsoleList
+                Effect: Allow
+                Action:
+                  - kms:ListKeys
+                  - kms:ListAliases
+                Resource: "*"
+
+              # Enables the AWS Console "Web UI CLI" (CloudShell).
+              - Sid: CloudShellAccess
+                Effect: Allow
+                Action:
+                  - cloudshell:*
+                Resource: "*"
+
+  AnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-AnalystRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AnalystReadOnlyS3KmsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListAllBucketsForConsole
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                Resource: "*"
+
+              - Sid: ListBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${SecureDataBucket}
+
+              - Sid: ObjectRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub arn:aws:s3:::${SecureDataBucket}/*
+
+              - Sid: KmsDecryptOnly
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt DataBucketKey.Arn
+
+  # ----------------------------
+  # Test Users + Groups (no access keys created)
+  # ----------------------------
+  AdminGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-AdminGroup
+      Policies:
+        - PolicyName: AllowAssumeAdminRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "sts:AssumeRole"
+                Resource: !GetAtt AdminRole.Arn
+
+  AnalystGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-AnalystGroup
+      Policies:
+        - PolicyName: AllowAssumeAnalystRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "sts:AssumeRole"
+                Resource: !GetAtt AnalystRole.Arn
+
+  AdminUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref AdminUserName
+      Groups:
+        - !Ref AdminGroup
+
+  AnalystUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref AnalystUserName
+      Groups:
+        - !Ref AnalystGroup
+
+Outputs:
+  BucketNameOut:
+    Description: Secure bucket name
+    Value: !Ref SecureDataBucket
+
+  KmsKeyArnOut:
+    Description: KMS key ARN
+    Value: !GetAtt DataBucketKey.Arn
+
+  AdminRoleArnOut:
+    Description: Admin role ARN
+    Value: !GetAtt AdminRole.Arn
+
+  AnalystRoleArnOut:
+    Description: Analyst role ARN
+    Value: !GetAtt AnalystRole.Arn
+
+  AdminUserOut:
+    Description: Test admin user name
+    Value: !Ref AdminUser
+
+  AnalystUserOut:
+    Description: Test analyst user name
+    Value: !Ref AnalystUser

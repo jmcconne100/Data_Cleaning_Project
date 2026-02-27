@@ -1,0 +1,158 @@
+ADMIN CLI TEST RUNBOOK (Test-Admin → Assume AdminRole → S3/KMS → Versioning)
+===========================================================================
+Purpose
+- Validate that a non-root identity (test-admin) can assume the AdminRole and:
+  - Upload to an SSE-KMS bucket
+  - Confirm encryption via head-object
+  - Create multiple versions by overwriting the same key
+  - Retrieve latest and a prior version
+
+To get new long-lived IAM user credentials (the ones that start with AKIA…) for test-admin, you do it in the AWS Console IAM screen (you can’t generate them from an expired ASIA… session).
+  - Go to IAM → Users
+  - Click test-admin
+  - Open the Security credentials tab
+  - Scroll to Access keys
+  - Click Create access key
+  - Choose Command Line Interface (CLI)
+  - Click Next → Create access key
+  - Copy both:
+  - Access key ID (AKIA...)
+  - Secret access key (shown only once)
+
+Notes / Assumptions
+- Bucket: jon-secure-bucket-aws
+- Object key: test.csv (bucket root; no prefixes used)
+- KMS enforcement: bucket policy may require the SSE-KMS header, so we always use --sse aws:kms
+- This runbook uses STS temporary credentials via environment variables. When you export them,
+  subsequent aws commands will use those creds (unless you force a different --profile).
+
+Before you start (one-time)
+1) Ensure AWS CLI is installed:
+   - aws --version
+2) Create access keys for IAM user test-admin (IAM Console → Users → test-admin → Security credentials)
+3) Configure the CLI profile for test-admin:
+   - aws configure --profile test-admin
+4) Confirm the role exists (from CloudFormation Outputs):
+   - arn:aws:iam::286036002000:role/Secure-S3-AdminRole
+
+---------------------------------------------------------------------------
+STEP 1 — Configure and verify the base identity (test-admin user)
+---------------------------------------------------------------------------
+
+aws configure --profile test-admin
+# Enter Access Key / Secret / Region / Output format (json recommended)
+
+aws sts get-caller-identity --profile test-admin
+# Expect Arn like: arn:aws:iam::286036002000:user/test-admin
+
+---------------------------------------------------------------------------
+STEP 2 — Assume the AdminRole using test-admin
+---------------------------------------------------------------------------
+
+aws sts assume-role \
+  --profile test-admin \
+  --role-arn arn:aws:iam::286036002000:role/Secure-S3-AdminRole \
+  --role-session-name admin-test
+# Copy Credentials.{AccessKeyId,SecretAccessKey,SessionToken} from the output
+
+# if error from dated credentials run
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN
+unset AWS_PROFILE
+
+# else grab
+export AWS_ACCESS_KEY_ID="ASIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_SESSION_TOKEN="..."
+# IMPORTANT: after these exports, DO NOT pass --profile unless you intend to override these creds.
+
+aws sts get-caller-identity
+# Expect Arn like: arn:aws:sts::286036002000:assumed-role/Secure-S3-AdminRole/admin-test
+
+---------------------------------------------------------------------------
+STEP 3 — Upload a test file with SSE-KMS (bucket root, key = test.csv)
+---------------------------------------------------------------------------
+
+echo "secure test" > test.csv
+
+aws s3 cp test.csv s3://jon-secure-bucket-aws/test.csv \
+  --sse aws:kms
+# Expect success (no AccessDenied)
+
+---------------------------------------------------------------------------
+STEP 4 — Confirm the object exists and is encrypted
+---------------------------------------------------------------------------
+
+aws s3api head-object \
+  --bucket jon-secure-bucket-aws \
+  --key test.csv \
+  --query "{Size:ContentLength,Modified:LastModified,Enc:ServerSideEncryption,Kms:SSEKMSKeyId}" \
+  --output table
+# Expect Enc = aws:kms
+
+---------------------------------------------------------------------------
+STEP 5 — Create a second version (overwrite same key)
+---------------------------------------------------------------------------
+
+echo "secure test v2" > test.csv
+
+aws s3 cp test.csv s3://jon-secure-bucket-aws/test.csv \
+  --sse aws:kms
+# This overwrite should create a new VersionId (since versioning is enabled)
+
+---------------------------------------------------------------------------
+STEP 6 — List versions for the object
+---------------------------------------------------------------------------
+
+aws s3api list-object-versions \
+  --bucket jon-secure-bucket-aws \
+  --prefix test.csv \
+  --query "Versions[].{IsLatest:IsLatest,VersionId:VersionId,LastModified:LastModified,Size:Size}" \
+  --output table
+# Copy an older VersionId (where IsLatest = false) for the next step.
+
+---------------------------------------------------------------------------
+STEP 7 — Confirm latest version content (no version-id = latest)
+---------------------------------------------------------------------------
+
+aws s3 cp s3://jon-secure-bucket-aws/test.csv ./latest.csv
+cat latest.csv
+# Expect: secure test v2
+
+---------------------------------------------------------------------------
+STEP 8 — Download a specific older version by VersionId
+---------------------------------------------------------------------------
+
+aws s3api get-object \
+  --bucket jon-secure-bucket-aws \
+  --key test.csv \
+  --version-id PASTE_OLD_VERSION_ID_HERE \
+  old.csv
+
+cat old.csv
+# Expect: secure test
+
+---------------------------------------------------------------------------
+STEP 9 — Cleanup: unset temporary credentials (recommended)
+---------------------------------------------------------------------------
+
+unset AWS_ACCESS_KEY_ID
+unset AWS_SECRET_ACCESS_KEY
+unset AWS_SESSION_TOKEN
+# After this, your terminal no longer acts as the assumed role.
+
+Troubleshooting
+- If assume-role fails with AccessDenied:
+  - Verify test-admin is in the correct group:
+    aws iam list-groups-for-user --user-name test-admin --profile test-admin
+  - Verify group policy allows sts:AssumeRole on Secure-S3-AdminRole:
+    aws iam list-group-policies --group-name Secure-S3-AdminGroup --profile test-admin
+- If upload fails with AccessDenied:
+  - Ensure you included --sse aws:kms (if your bucket policy enforces the header)
+  - Re-check identity: aws sts get-caller-identity
+- If head-object returns 404:
+  - Wrong key name/path OR upload didn’t actually succeed
+  - List objects: aws s3 ls s3://jon-secure-bucket-aws/ --recursive
+
+

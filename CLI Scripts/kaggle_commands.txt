@@ -1,0 +1,132 @@
+KAGGLE → AWS CLOUDSHELL → S3 (Admin Role) RUNBOOK
+================================================
+
+Purpose
+- Use the AWS Console browser shell (AWS CloudShell) to:
+  1) install/configure Kaggle CLI
+  2) download a Kaggle dataset to CloudShell storage
+  3) unzip it (if needed)
+  4) upload it to your KMS-encrypted S3 bucket using your AdminRole permissions
+
+Assumptions
+- You will run this in AWS Console → CloudShell (browser-based AWS CLI).
+- You have permissions to write to the bucket (AdminRole).
+- Your bucket policy may enforce SSE-KMS headers, so we include --sse aws:kms.
+- You have a Kaggle account + API token (kaggle.json), and you’ve accepted dataset terms on Kaggle.
+
+Customize These (edit values)
+- BUCKET:    jon-secure-bucket-aws
+- DATASET:   owner/dataset (from Kaggle)
+- S3_PREFIX: kaggle/<dataset-slug>/
+
+-----------------------------------------------------------------------
+STEP 0 — Open CloudShell
+-----------------------------------------------------------------------
+AWS Console (top right) → CloudShell icon (terminal prompt opens)
+
+(Optional sanity)
+aws --version
+
+-----------------------------------------------------------------------
+STEP 1 — Confirm identity (should be your AdminRole context)
+-----------------------------------------------------------------------
+aws sts get-caller-identity
+# Expect assumed-role/...AdminRole...
+
+-----------------------------------------------------------------------
+STEP 2 — Install Kaggle CLI in CloudShell
+-----------------------------------------------------------------------
+python3 -m pip install --user --upgrade kaggle
+
+# Ensure the user-installed binaries are on PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# Verify
+kaggle --version
+
+-----------------------------------------------------------------------
+STEP 3 — Add your Kaggle API token (kaggle.json) in CloudShell
+-----------------------------------------------------------------------
+You need your kaggle.json contents available. You have two browser-friendly options:
+
+OPTION A (Recommended): Upload kaggle.json directly into CloudShell
+- In the CloudShell UI, click Actions → Upload file
+- Select kaggle.json from your computer
+- It will upload into your CloudShell home directory (~)
+
+Then run:
+mkdir -p ~/.kaggle
+mv ~/kaggle.json ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+
+OPTION B: Create the file by pasting contents
+mkdir -p ~/.kaggle
+nano ~/.kaggle/kaggle.json
+# Paste the JSON exactly, save, exit
+chmod 600 ~/.kaggle/kaggle.json
+
+Quick test:
+kaggle datasets list -s "credit" | head
+
+-----------------------------------------------------------------------
+STEP 4 — Set variables for your dataset and S3 destination
+-----------------------------------------------------------------------
+BUCKET="jon-secure-bucket-aws"
+DATASET="zynicide/wine-reviews"          # example: owner/dataset
+S3_PREFIX="kaggle/wine-reviews/"         # where it will live in S3
+WORKDIR="$HOME/kaggle_dl/wine-reviews"
+
+mkdir -p "$WORKDIR"
+
+-----------------------------------------------------------------------
+STEP 5 — Download dataset from Kaggle into CloudShell
+-----------------------------------------------------------------------
+kaggle datasets download -d "$DATASET" -p "$WORKDIR"
+
+# See what you got (often a .zip)
+ls -lah "$WORKDIR"
+
+-----------------------------------------------------------------------
+STEP 6 — Unzip (if the download is a zip)
+-----------------------------------------------------------------------
+# If you see a .zip file, unzip it:
+unzip -o "$WORKDIR"/*.zip -d "$WORKDIR"
+
+# Verify contents
+ls -lah "$WORKDIR"
+
+-----------------------------------------------------------------------
+STEP 7 — Upload to S3 with SSE-KMS (recursive)
+-----------------------------------------------------------------------
+aws s3 cp "$WORKDIR/" "s3://${BUCKET}/${S3_PREFIX}" \
+  --recursive \
+  --sse aws:kms
+
+-----------------------------------------------------------------------
+STEP 8 — Confirm upload
+-----------------------------------------------------------------------
+aws s3 ls "s3://${BUCKET}/${S3_PREFIX}" --recursive
+
+-----------------------------------------------------------------------
+STEP 9 — Optional: Clean up CloudShell local files
+-----------------------------------------------------------------------
+rm -rf "$WORKDIR"
+# (Optional) remove Kaggle token if you don’t want it stored in CloudShell:
+# rm -f ~/.kaggle/kaggle.json
+
+-----------------------------------------------------------------------
+TROUBLESHOOTING
+-----------------------------------------------------------------------
+- Kaggle download fails with 403 / permission:
+  - You may need to accept the dataset’s rules/terms on Kaggle’s website first.
+- kaggle: command not found:
+  - Ensure PATH is set:
+    export PATH="$HOME/.local/bin:$PATH"
+- unzip: command not found (rare in CloudShell):
+  - Try: sudo yum -y install unzip   (or sudo apt-get install unzip)
+- S3 upload AccessDenied:
+  - Confirm your CloudShell identity:
+    aws sts get-caller-identity
+  - Ensure you included --sse aws:kms if your bucket policy enforces it.
+
+End of runbook.
